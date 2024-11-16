@@ -7,6 +7,8 @@ static void *ngx_http_ipbind_create_conf(ngx_conf_t *cf);
 static char *ngx_http_ipbind_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_ipbind_init_zone(ngx_shm_zone_t *shm_zone, void *data);
 static char *ngx_http_ipbind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_ipbind_postaccess_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_ipbind_init(ngx_conf_t *cf);
 
 typedef struct {
    ngx_shm_zone_t *shm_zone;
@@ -44,7 +46,7 @@ static ngx_command_t  ngx_http_ipbind_commands[] = {
 
 static ngx_http_module_t  ngx_http_ipbind_module_ctx = {
    NULL,
-   NULL,
+   ngx_http_ipbind_init, /* postconfiguration */
    NULL,
    NULL,
    NULL,
@@ -88,25 +90,12 @@ static ngx_int_t ngx_http_ipbind_handler(ngx_http_request_t *r)
       ip_check_ok = node->addr_text.len == r->connection->addr_text.len && ngx_strncmp(node->addr_text.data, r->connection->addr_text.data, node->addr_text.len) == 0;
    } else {
       ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "URI not accessed yet");
-
-      node = ngx_slab_calloc_locked(shpool, sizeof(ngx_http_ipbind_node_t) + r->uri.len + r->connection->addr_text.len);
-      // TODO: alloc check
-      node->node.node.key = hash;
-      node->node.str.data = (u_char *) node + sizeof(ngx_http_ipbind_node_t);
-      node->node.str.len = r->uri.len;
-      ngx_memcpy(node->node.str.data, r->uri.data, r->uri.len);
-
-      node->addr_text.data = (u_char *) node + sizeof(ngx_http_ipbind_node_t) + r->uri.len;
-      node->addr_text.len = r->connection->addr_text.len;
-      ngx_memcpy(node->addr_text.data, r->connection->addr_text.data, r->connection->addr_text.len);
-
-      ngx_rbtree_insert(&shctx->rbtree, &node->node.node);
       ip_check_ok = true;
    }
 
    ngx_shmtx_unlock(&shpool->mutex);
 
-   if(!ip_check_ok) {
+   if(!ip_check_ok && node) {
       ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
          "access denied: %V expected but %V found", &node->addr_text, &r->connection->addr_text);
    }
@@ -161,7 +150,52 @@ static char *ngx_http_ipbind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
    ngx_http_core_loc_conf_t  *clcf;
    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
    clcf->handler = ngx_http_ipbind_handler;
+
    return NGX_CONF_OK;
+}
+
+static ngx_int_t ngx_http_ipbind_init(ngx_conf_t *cf) {
+   ngx_http_core_main_conf_t *cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+   ngx_http_handler_pt *h = ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
+   if (h == NULL) {
+       return NGX_ERROR;
+   }
+
+   *h = ngx_http_ipbind_postaccess_handler;
+   return NGX_OK;
+}
+
+static ngx_int_t ngx_http_ipbind_postaccess_handler(ngx_http_request_t *r) {
+   if(r->error_page) {
+      return NGX_OK; // not interested / mitigate memory extinction attacks
+   }
+
+   ngx_http_ipbind_conf_t *ipbindcf = ngx_http_get_module_loc_conf(r, ngx_http_ipbind_module);
+   ngx_slab_pool_t *shpool = (ngx_slab_pool_t *) ipbindcf->shm_zone->shm.addr;
+   ngx_http_ipbind_shctx_t *shctx = ipbindcf->shm_zone->data;
+   uint32_t hash = ngx_hash_key(r->uri.data, r->uri.len);
+
+   ngx_shmtx_lock(&shpool->mutex);
+   ngx_http_ipbind_node_t *node = ngx_slab_calloc_locked(shpool, sizeof(ngx_http_ipbind_node_t) + r->uri.len + r->connection->addr_text.len);
+
+   if(!node) {
+      ngx_shmtx_unlock(&shpool->mutex);
+      // something went wrong, hope to see calloc failure message in error_log
+      return NGX_OK;
+   }
+
+   node->node.node.key = hash;
+   node->node.str.data = (u_char *) node + sizeof(ngx_http_ipbind_node_t);
+   node->node.str.len = r->uri.len;
+   ngx_memcpy(node->node.str.data, r->uri.data, r->uri.len);
+
+   node->addr_text.data = (u_char *) node + sizeof(ngx_http_ipbind_node_t) + r->uri.len;
+   node->addr_text.len = r->connection->addr_text.len;
+   ngx_memcpy(node->addr_text.data, r->connection->addr_text.data, r->connection->addr_text.len);
+
+   ngx_rbtree_insert(&shctx->rbtree, &node->node.node);
+   ngx_shmtx_unlock(&shpool->mutex);
+   return NGX_OK;
 }
 
 static void *ngx_http_ipbind_create_conf(ngx_conf_t *cf) {
