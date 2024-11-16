@@ -2,9 +2,18 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+static char *ngx_http_ipbind_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_ipbind_init_zone(ngx_shm_zone_t *shm_zone, void *data);
 static char *ngx_http_ipbind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 static ngx_command_t  ngx_http_ipbind_commands[] = {
+   { ngx_string("ipbind_zone"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
+      ngx_http_ipbind_zone,
+      0,
+      0,
+      NULL
+   },
    {
       ngx_string("print_hello"),
       NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
@@ -69,6 +78,30 @@ static ngx_int_t ngx_http_ipbind_handler(ngx_http_request_t *r)
    b->last_buf = 1;
 
    return ngx_http_output_filter(r, out);
+}
+
+static char *ngx_http_ipbind_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+   ngx_str_t *value = cf->args->elts;
+   ssize_t size = ngx_parse_size(&value[2]);
+
+   if (size == NGX_ERROR) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid zone size \"%V\"", &value[2]);
+      return NGX_CONF_ERROR;
+   }
+
+   ngx_shm_zone_t *shm_zone = ngx_shared_memory_add(cf, &value[1], size, &ngx_http_ipbind_module);
+   if (shm_zone == NULL) {
+       return NGX_CONF_ERROR;
+   }
+
+   shm_zone->init = ngx_http_ipbind_init_zone;
+   shm_zone->data = NULL;
+
+   return NGX_CONF_OK;
+}
+
+static ngx_int_t ngx_http_ipbind_init_zone(ngx_shm_zone_t *shm_zone, void *data) {
+   return NGX_OK;
 }
 
 static char *ngx_http_ipbind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
